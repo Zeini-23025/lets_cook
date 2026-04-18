@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -151,8 +152,12 @@ APP_LIBRARY = [
                  "reg_name": "Hyper"},
      "linux":   {"cmd": "hyper", "check": "hyper", "args": []}},
 
-    {"cat": "Terminals", "name": "Kitty", "platform": "linux",
-     "windows": None,
+    {"cat": "Terminals", "name": "Kitty", "platform": "both",
+     "windows": {"cmd": "kitty", "check": "kitty", "args": [],
+                 "paths": [f"{_LA}/Programs/kitty/kitty.exe",
+                            f"{_PF}/kitty/bin/kitty.exe",
+                            f"{_PF86}/kitty/bin/kitty.exe"],
+                 "reg_name": "kitty"},
      "linux":   {"cmd": "kitty", "check": "kitty", "args": []}},
 
     {"cat": "Terminals", "name": "Tilix", "platform": "linux",
@@ -176,13 +181,6 @@ APP_LIBRARY = [
                             f"{_PF86}/Mozilla Firefox/firefox.exe"],
                  "reg_name": "Mozilla Firefox"},
      "linux":   {"cmd": "firefox", "check": "firefox", "args": []}},
-
-    {"cat": "Browsers", "name": "Edge", "platform": "both",
-     "windows": {"cmd": "msedge", "check": "msedge", "args": [],
-                 "paths": [f"{_PF}/Microsoft/Edge/Application/msedge.exe",
-                            f"{_PF86}/Microsoft/Edge/Application/msedge.exe"],
-                 "reg_name": "Microsoft Edge"},
-     "linux":   {"cmd": "microsoft-edge", "check": "microsoft-edge", "args": []}},
 
     {"cat": "Browsers", "name": "Brave", "platform": "both",
      "windows": {"cmd": f"{_PF}/BraveSoftware/Brave-Browser/Application/brave.exe",
@@ -303,12 +301,6 @@ APP_LIBRARY = [
                  "reg_name": "Discord"},
      "linux":   {"cmd": "discord", "check": "discord", "args": []}},
 
-    {"cat": "Communication", "name": "Microsoft Teams", "platform": "both",
-     "windows": {"cmd": "teams", "check": "teams", "args": [],
-                 "paths": [f"{_LA}/Microsoft/Teams/current/Teams.exe"],
-                 "reg_name": "Microsoft Teams"},
-     "linux":   {"cmd": "teams", "check": "teams", "args": []}},
-
     {"cat": "Communication", "name": "Zoom", "platform": "both",
      "windows": {"cmd": "zoom", "check": "zoom", "args": [],
                  "paths": [f"{_AP}/Zoom/bin/Zoom.exe",
@@ -366,8 +358,12 @@ def _enable_ansi():
     if IS_WINDOWS:
         try:
             import ctypes
-            ctypes.windll.kernel32.SetConsoleMode(
-                ctypes.windll.kernel32.GetStdHandle(-11), 7)
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # Preserve existing console flags; only add virtual terminal processing.
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
         except Exception:
             pass
 
@@ -382,6 +378,17 @@ def cyan(t):   return _c(str(t), "36")
 def red(t):    return _c(str(t), "31")
 def bold(t):   return _c(str(t), "1")
 def dim(t):    return _c(str(t), "2")
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+def _render_rows(lines: list[str], cols: int) -> int:
+    """Count terminal rows occupied by rendered lines (accounting for wraps)."""
+    cols = max(cols, 1)
+    rows = 0
+    for line in lines:
+        plain = _ANSI_RE.sub("", line)
+        rows += max(1, (len(plain) + cols - 1) // cols)
+    return rows
 
 def section(title: str):
     print(f"\n{bold('─' * 50)}")
@@ -566,7 +573,7 @@ def pick_apps(available: list, pre_selected: set = None) -> list:
     cursor   = 0
     search   = ""
     offset   = 0    # first visible index into filtered list
-    prev_n   = 0    # lines printed in last frame (for erase)
+    prev_rows = 0   # rendered terminal rows in last frame (includes wrapped lines)
 
     # Pre-warm install cache before entering raw mode
     sys.stdout.write(f"\n  {bold('Checking installation status...')} ")
@@ -592,6 +599,19 @@ def pick_apps(available: list, pre_selected: set = None) -> list:
 
         # ── Build frame ──
         SEP = "─" * 54
+        term_cols = shutil.get_terminal_size((80, 24)).columns
+        # Keep row width inside terminal to prevent wrapping, which can desync redraw on Windows.
+        name_w = 22
+        cat_w = 20
+        if term_cols < 72:
+            shrink = 72 - term_cols
+            cat_cut = min(shrink, cat_w - 8)
+            cat_w -= cat_cut
+            shrink -= cat_cut
+            if shrink > 0:
+                name_cut = min(shrink, name_w - 8)
+                name_w -= name_cut
+
         frame = []
         frame.append(f"  {bold(SEP)}")
         search_display = cyan(search) if search else dim("type to filter…")
@@ -614,9 +634,9 @@ def pick_apps(available: list, pre_selected: set = None) -> list:
 
                 # Build plain strings first (no ANSI) for correct width calculation
                 tick  = "[x]" if ticked else "[ ]"
-                name  = app["name"][:22].ljust(22)
+                name  = app["name"][:name_w].ljust(name_w)
                 badge = "installed" if inst else "not found"
-                cat   = app["cat"][:20]
+                cat   = app["cat"][:cat_w]
                 arrow = "> " if i == cursor else "  "
 
                 if i == cursor:
@@ -637,11 +657,12 @@ def pick_apps(available: list, pre_selected: set = None) -> list:
         frame.append(f"  {bold(SEP)}")
 
         # ── Erase last frame, draw new one ──
-        if prev_n:
-            sys.stdout.write(f"\033[{prev_n}F\033[J")
+        if prev_rows:
+            # Move to previous frame start and clear downward.
+            sys.stdout.write(f"\033[{prev_rows}F\033[J")
         sys.stdout.write("\n".join(frame) + "\n")
         sys.stdout.flush()
-        prev_n = len(frame)
+        prev_rows = _render_rows(frame, term_cols)
 
         # ── Handle keypress ──
         try:
@@ -1058,7 +1079,6 @@ def main():
         return
 
     if not config:
-        print(BANNER)
         print(yellow("  No config found — let's set things up!\n"))
         config = run_setup()
 
